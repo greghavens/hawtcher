@@ -16,6 +16,10 @@ Hawtcher is an autonomous monitoring agent that watches Claude Code's activity i
   - Makes hallucinations or incorrect assumptions
   - Says it will "monitor" or "check later" (which it cannot do)
 - **Direct Interaction**: Sends correction messages directly to Claude Code via hooks
+- **Remote Question Answering** (Optional): Forward Claude Code's questions to your phone via Telegram
+  - Automatically attempts to answer with devstral first
+  - Only asks you when confidence is low (<95% configurable)
+  - Answer from anywhere, continue working remotely
 - **Beautiful Terminal UI**: Rich console interface with colored alerts and severity levels
 - **Detailed Logging**: Records all interventions to a log file
 
@@ -25,6 +29,7 @@ Hawtcher is an autonomous monitoring agent that watches Claude Code's activity i
 2. **LM Studio** installed and running
 3. **devstral model** loaded in LM Studio
 4. **Claude Code** running in another directory
+5. **Telegram account** (optional, for remote question answering)
 
 ## Installation
 
@@ -151,6 +156,75 @@ You should see:
 }
 ```
 
+### 7. Setup Telegram Remote Answer Relay (Optional)
+
+Hawtcher can forward Claude Code's questions to you via Telegram when you're away from your computer.
+
+**How it works:**
+1. Claude Code asks a question (e.g., "Should I use JWT or OAuth2?")
+2. Hawtcher asks devstral to attempt answering
+3. If devstral's confidence is below threshold (default 95%), forwards question to your Telegram
+4. You answer on your phone
+5. Hawtcher sends your answer back to Claude Code
+6. Claude Code continues with your answer
+
+**Setup:**
+
+```bash
+# Interactive setup wizard
+python setup-telegram.py
+```
+
+The wizard will:
+- Guide you through creating a bot with @BotFather
+- Auto-detect your Telegram chat ID
+- Update your .env file automatically
+
+**Manual setup:**
+
+1. Create bot via @BotFather on Telegram:
+   - Send `/newbot` to @BotFather
+   - Follow prompts to name your bot
+   - Copy the bot token
+
+2. Update `.env`:
+   ```bash
+   TELEGRAM_BOT_TOKEN=your_bot_token_here
+   ENABLE_TELEGRAM_RELAY=true
+   QUESTION_CONFIDENCE_THRESHOLD=0.95
+   ```
+
+3. Get your chat ID:
+   - Run Hawtcher with Telegram enabled
+   - Send `/start` to your bot
+   - Your chat ID will be detected and displayed
+
+**Configuration options:**
+- `TELEGRAM_BOT_TOKEN`: Bot token from @BotFather
+- `TELEGRAM_CHAT_ID`: Your personal chat ID (auto-detected)
+- `ENABLE_TELEGRAM_RELAY`: Enable/disable feature (default: false)
+- `QUESTION_CONFIDENCE_THRESHOLD`: When to ask user (default: 0.95)
+- `TELEGRAM_RESPONSE_TIMEOUT`: How long to wait for answer in seconds (default: 300)
+
+**Example question flow:**
+
+```
+📨 Claude Code Question #1
+━━━━━━━━━━━━━━━━━━━━━
+Task: Implement user authentication
+
+Question:
+Should I use JWT tokens or session-based auth?
+
+devstral's suggestion (65% confident):
+"Use JWT with refresh tokens"
+
+Your answer:
+[You type in Telegram] → "Use OAuth2 with PKCE flow"
+
+✅ Answer sent to Claude Code
+```
+
 ## Usage
 
 ### Basic Usage
@@ -221,20 +295,42 @@ Claude Code receives and responds to intervention
 Claude Code corrects course and continues working
 ```
 
+### Question Answering Flow (Optional Telegram Feature)
+
+```
+Claude Code asks: "Should I use JWT or OAuth2?"
+         ↓
+Hawtcher detects question in history.jsonl
+         ↓
+Asks devstral to attempt answer → 65% confidence
+         ↓
+Below 95% threshold → Forward to Telegram
+         ↓
+You answer on phone: "Use OAuth2 with PKCE"
+         ↓
+Hawtcher writes answer to intervention file
+         ↓
+Claude Code receives answer and continues
+```
+
 ## Architecture
 
 ```
-hawtcher.py                   # Main CLI application
+hawtcher.py                      # Main CLI application
 monitor/
-├── __init__.py              # Package initialization
-├── models.py                # Pydantic data models
-├── watcher.py               # File system monitoring
-├── llm_client.py            # LM Studio/devstral integration
-├── analyzer.py              # Task compliance analysis
-└── interventor.py           # Intervention handling & injection
+├── __init__.py                 # Package initialization
+├── models.py                   # Pydantic data models
+├── watcher.py                  # File system monitoring
+├── llm_client.py               # LM Studio/devstral integration
+├── analyzer.py                 # Task compliance analysis
+├── interventor.py              # Intervention handling & injection
+├── question_detector.py        # Question pattern detection
+├── question_answerer.py        # Automated question answering
+└── telegram_relay.py           # Telegram bot integration
 
-claude-code-hook.sh           # Hook script for Claude Code
-install-claude-hook.sh        # Hook installation script
+claude-code-hook.sh              # Hook script for Claude Code
+install-claude-hook.sh           # Hook installation script
+setup-telegram.py                # Telegram bot setup wizard
 ```
 
 ### Integration Points
@@ -243,6 +339,8 @@ install-claude-hook.sh        # Hook installation script
 - **Hook → Claude Code**: Reads intervention file and injects as user input
 - **Claude Code → History**: Activity logged to `~/.claude/history.jsonl`
 - **History → Hawtcher**: Monitors for new events to analyze
+- **Hawtcher → Telegram** (Optional): Forwards questions when devstral confidence low
+- **Telegram → Hawtcher**: User answers received and relayed to Claude Code
 
 ## Configuration
 
