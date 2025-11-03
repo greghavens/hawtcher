@@ -12,6 +12,8 @@ from monitor.models import (
     TaskContext,
 )
 from monitor.llm_client import DevstralClient
+from monitor.question_detector import QuestionDetector
+from monitor.question_answerer import QuestionAnswerer, AnswerAttempt
 
 
 class TaskAnalyzer:
@@ -25,11 +27,17 @@ class TaskAnalyzer:
         context_window_size: int,
         intervention_threshold: float,
         on_intervention: Optional[Callable[[InterventionDecision], None]] = None,
+        question_detector: Optional[QuestionDetector] = None,
+        question_answerer: Optional[QuestionAnswerer] = None,
+        on_question: Optional[Callable[[str, AnswerAttempt], Optional[str]]] = None,
     ):
         self.llm_client = llm_client
         self.context_window_size = context_window_size
         self.intervention_threshold = intervention_threshold
         self.on_intervention = on_intervention
+        self.question_detector = question_detector
+        self.question_answerer = question_answerer
+        self.on_question = on_question
 
         self.user_instruction: Optional[str] = None
         self.current_todos: list[str] = []
@@ -70,6 +78,11 @@ class TaskAnalyzer:
         # Auto-detect user instructions from events
         if not self.user_instruction:
             self.user_instruction = event.display
+
+        # Check if Claude Code is asking a question
+        if self.question_detector and self.question_detector.is_question(event.display):
+            self._handle_question(event.display)
+            return  # Skip other analysis when handling a question
 
         # Check for suspicious patterns immediately
         if self._is_suspicious_activity(event.display):
@@ -180,3 +193,40 @@ class TaskAnalyzer:
         )
 
         return "\n".join(message_parts)
+
+    def _handle_question(self, activity: str) -> None:
+        """
+        Handle a question from Claude Code.
+
+        Args:
+            activity: The activity text containing the question
+        """
+        if not self.question_answerer or not self.on_question:
+            return
+
+        # Extract question and context
+        question, context = self.question_detector.get_question_context(activity)
+        if not question:
+            return
+
+        # Build task context
+        task_context = TaskContext(
+            user_instruction=self.user_instruction or "Unknown task",
+            recent_events=list(self.recent_events),
+            current_todos=self.current_todos,
+            completed_todos=self.completed_todos,
+        )
+
+        # Try to answer with devstral
+        answer_attempt = self.question_answerer.try_answer(
+            question,
+            task_context,
+            context,
+        )
+
+        # Call the question callback with the attempt
+        # The callback will decide whether to use devstral's answer or ask the user
+        user_answer = self.on_question(question, answer_attempt)
+
+        # Note: The callback is responsible for sending the answer to Claude Code
+        # via the intervention file if needed

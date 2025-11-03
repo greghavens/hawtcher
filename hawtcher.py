@@ -18,8 +18,11 @@ from rich.text import Text
 from monitor.analyzer import TaskAnalyzer
 from monitor.interventor import Interventor
 from monitor.llm_client import DevstralClient
-from monitor.models import ClaudeHistoryEvent, InterventionDecision
+from monitor.models import ClaudeHistoryEvent, InterventionDecision, AnalysisResult
 from monitor.watcher import HistoryMonitor
+from monitor.question_detector import QuestionDetector
+from monitor.question_answerer import QuestionAnswerer, AnswerAttempt
+from monitor.telegram_relay import TelegramRelay
 
 
 class Settings(BaseSettings):
@@ -33,6 +36,13 @@ class Settings(BaseSettings):
     context_window_size: int = 10
     intervention_threshold: float = 0.7
     log_level: str = "INFO"
+
+    # Telegram settings
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    enable_telegram_relay: bool = False
+    question_confidence_threshold: float = 0.95
+    telegram_response_timeout: int = 300
 
     class Config:
         env_file = ".env"
@@ -59,11 +69,31 @@ class HawtcherApp:
             log_path=Path("interventions.log"),
         )
 
+        # Initialize question handling components
+        self.question_detector = QuestionDetector()
+        self.question_answerer = QuestionAnswerer(
+            llm_client=self.llm_client,
+            confidence_threshold=settings.question_confidence_threshold,
+        )
+
+        # Initialize Telegram relay if enabled
+        self.telegram_relay: Optional[TelegramRelay] = None
+        if settings.enable_telegram_relay and settings.telegram_bot_token:
+            self.telegram_relay = TelegramRelay(
+                bot_token=settings.telegram_bot_token,
+                chat_id=settings.telegram_chat_id if settings.telegram_chat_id else None,
+                response_timeout=settings.telegram_response_timeout,
+            )
+            self.telegram_relay.on_chat_id_detected = self._save_chat_id
+
         self.analyzer = TaskAnalyzer(
             llm_client=self.llm_client,
             context_window_size=settings.context_window_size,
             intervention_threshold=settings.intervention_threshold,
             on_intervention=self._handle_intervention,
+            question_detector=self.question_detector,
+            question_answerer=self.question_answerer,
+            on_question=self._handle_question,
         )
 
         self.monitor: Optional[HistoryMonitor] = None
@@ -76,6 +106,83 @@ class HawtcherApp:
         """Handle new Claude Code events."""
         self.interventor.display_event(event.display)
         self.analyzer.process_event(event)
+
+    def _handle_question(self, question: str, answer_attempt: AnswerAttempt) -> Optional[str]:
+        """
+        Handle a question from Claude Code.
+
+        Args:
+            question: The question Claude Code is asking
+            answer_attempt: devstral's attempt to answer
+
+        Returns:
+            The answer to send to Claude Code
+        """
+        self.console.print()
+        self.console.print(f"[bold yellow]📨 Claude Code Question Detected[/bold yellow]")
+        self.console.print(f"[cyan]Q: {question}[/cyan]")
+        self.console.print()
+
+        # Display devstral's attempt
+        if answer_attempt.answer:
+            self.console.print(f"[dim]devstral's answer ({answer_attempt.confidence:.1%} confident):[/dim]")
+            self.console.print(f"[dim]  {answer_attempt.answer}[/dim]")
+            self.console.print(f"[dim]  Reasoning: {answer_attempt.reasoning}[/dim]")
+            self.console.print()
+
+        # Decide whether to use devstral's answer or ask user
+        if answer_attempt.should_ask_user:
+            self.console.print(f"[yellow]⚠ Confidence below threshold ({self.settings.question_confidence_threshold:.1%})[/yellow]")
+
+            # Try Telegram if enabled
+            if self.telegram_relay:
+                self.console.print("[cyan]Forwarding question to Telegram...[/cyan]")
+                user_answer = self.telegram_relay.ask_question(
+                    question=question,
+                    task_description=self.analyzer.user_instruction or "Unknown task",
+                    devstral_suggestion=answer_attempt.answer if answer_attempt.answer else None,
+                    devstral_confidence=answer_attempt.confidence if answer_attempt.answer else None,
+                )
+
+                if user_answer:
+                    self.console.print(f"[green]✅ Answer received from Telegram: {user_answer}[/green]")
+                    answer = user_answer
+                else:
+                    self.console.print("[yellow]No response from Telegram, using devstral's answer[/yellow]")
+                    answer = answer_attempt.answer or "Please clarify your question."
+            else:
+                # No Telegram, use devstral's best guess
+                self.console.print("[yellow]No Telegram relay configured, using devstral's answer[/yellow]")
+                answer = answer_attempt.answer or "Please clarify your question."
+        else:
+            # High confidence, use devstral's answer
+            self.console.print(f"[green]✅ Using devstral's answer (high confidence)[/green]")
+            answer = answer_attempt.answer
+
+        # Send answer to Claude Code via intervention file
+        self.interventor._write_intervention_file(
+            InterventionDecision(
+                should_intervene=True,
+                severity="low",
+                intervention_message=f"Answer to your question:\n{answer}",
+                analysis=AnalysisResult(
+                    is_on_task=True,
+                    confidence=1.0,
+                    reasoning="Answering Claude Code's question",
+                    detected_issues=[],
+                ),
+            )
+        )
+
+        self.console.print(f"[bold green]Answer sent to Claude Code[/bold green]")
+        self.console.print()
+
+        return answer
+
+    def _save_chat_id(self, chat_id: str) -> None:
+        """Save detected chat ID to .env file."""
+        self.console.print(f"[green]Telegram chat ID detected: {chat_id}[/green]")
+        self.console.print("[yellow]Add this to your .env file: TELEGRAM_CHAT_ID={chat_id}[/yellow]")
 
     def _display_banner(self) -> None:
         """Display startup banner."""
@@ -173,6 +280,15 @@ class HawtcherApp:
             )
             return
 
+        # Start Telegram bot if enabled
+        if self.telegram_relay:
+            self.interventor.display_status("Starting Telegram relay...", "green")
+            self.telegram_relay.start()
+            if not self.settings.telegram_chat_id:
+                self.console.print()
+                self.console.print("[yellow]Note: Send /start to your bot to link your Telegram account[/yellow]")
+                self.console.print()
+
         # Set user instruction if provided
         if user_instruction:
             self.analyzer.set_user_instruction(user_instruction)
@@ -207,6 +323,9 @@ class HawtcherApp:
 
         if self.monitor:
             self.monitor.stop()
+
+        if self.telegram_relay:
+            self.telegram_relay.stop()
 
         self.console.print()
         self.console.print(

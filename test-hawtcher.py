@@ -16,6 +16,8 @@ from rich.prompt import Prompt, Confirm
 from monitor.llm_client import DevstralClient
 from monitor.models import TaskContext, ClaudeHistoryEvent, InterventionDecision
 from monitor.interventor import Interventor
+from monitor.question_detector import QuestionDetector
+from monitor.question_answerer import QuestionAnswerer
 
 # Load environment
 load_dotenv()
@@ -168,9 +170,85 @@ def test_intervention_writing(intervention_file: Path) -> bool:
         return False
 
 
+def test_question_detection() -> bool:
+    """Test question detection patterns."""
+    console.print("\n[yellow]4. Testing question detection...[/yellow]")
+
+    detector = QuestionDetector()
+
+    test_cases = [
+        ("Should I use TypeScript or JavaScript?", True),
+        ("Which authentication method do you prefer?", True),
+        ("Do you want me to create unit tests?", True),
+        ("Can I proceed with this approach?", True),
+        ("I'm analyzing the code to understand the structure", False),
+        ("What is this function doing? Let me check...", False),
+        ("The build completed successfully", False),
+    ]
+
+    passed = 0
+    failed = 0
+
+    for text, expected in test_cases:
+        result = detector.is_question(text)
+        if result == expected:
+            passed += 1
+            console.print(f"  [green]✓[/green] '{text[:50]}...' -> {result}")
+        else:
+            failed += 1
+            console.print(f"  [red]✗[/red] '{text[:50]}...' -> {result} (expected {expected})")
+
+    console.print(f"\n  Results: {passed} passed, {failed} failed")
+
+    if failed == 0:
+        console.print("[green]✓ Question detection working correctly[/green]")
+        return True
+    else:
+        console.print("[red]✗ Some question detection tests failed[/red]")
+        return False
+
+
+def test_question_answering(client: DevstralClient) -> bool:
+    """Test question answering with devstral."""
+    console.print("\n[yellow]5. Testing question answering...[/yellow]")
+
+    answerer = QuestionAnswerer(client, confidence_threshold=0.95)
+
+    context = TaskContext(
+        user_instruction="Build a REST API for user authentication",
+        recent_events=[],
+        current_todos=["Implement JWT auth", "Add login endpoint"],
+    )
+
+    question = "Should I use JWT tokens or session-based authentication?"
+
+    console.print(f"  Question: [cyan]{question}[/cyan]")
+    console.print("  Asking devstral...")
+
+    try:
+        answer_attempt = answerer.try_answer(question, context)
+
+        console.print(f"\n  [bold]Answer Attempt:[/bold]")
+        console.print(f"    Answer: {answer_attempt.answer}")
+        console.print(f"    Confidence: {answer_attempt.confidence:.1%}")
+        console.print(f"    Should ask user: {answer_attempt.should_ask_user}")
+        console.print(f"    Reasoning: {answer_attempt.reasoning}")
+
+        if answer_attempt.answer:
+            console.print("[green]✓ devstral provided an answer[/green]")
+            return True
+        else:
+            console.print("[yellow]⚠ devstral couldn't answer confidently[/yellow]")
+            return False
+
+    except Exception as e:
+        console.print(f"[red]✗ Error: {e}[/red]")
+        return False
+
+
 def test_real_scenario(client: DevstralClient, intervention_file: Path):
     """Run a full test scenario."""
-    console.print("\n[yellow]4. Full scenario test (optional)[/yellow]")
+    console.print("\n[yellow]6. Full scenario test (optional)[/yellow]")
 
     if not Confirm.ask("Run a full scenario test?", default=True):
         return
@@ -267,7 +345,13 @@ def main():
     # Test 3: File writing
     results.append(("Intervention Writing", test_intervention_writing(intervention_file)))
 
-    # Test 4: Real scenario
+    # Test 4: Question detection
+    results.append(("Question Detection", test_question_detection()))
+
+    # Test 5: Question answering
+    results.append(("Question Answering", test_question_answering(client)))
+
+    # Test 6: Real scenario
     test_real_scenario(client, intervention_file)
 
     # Summary
